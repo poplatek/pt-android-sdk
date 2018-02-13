@@ -1,0 +1,11 @@
+# For Poplatek internal testing use.
+sudo: required
+language: java
+addons:
+  apt:
+    packages:
+    - uncrustify
+script:
+- make fixme-check
+# Disabled, travis's uncrustify is too old.
+#- make uncrustify-check-legacy
