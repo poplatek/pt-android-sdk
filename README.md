@@ -1,0 +1,1 @@
+# pt-android-sdk-private
