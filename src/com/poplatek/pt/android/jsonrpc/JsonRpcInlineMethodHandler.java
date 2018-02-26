@@ -8,5 +8,5 @@ package com.poplatek.pt.android.jsonrpc;
 import org.json.JSONObject;
 
 public interface JsonRpcInlineMethodHandler extends JsonRpcMethodHandler {
-    public JSONObject handle(JSONObject params, JsonRpcMethodExtras extras) throws Exception;
+    JSONObject handle(JSONObject params, JsonRpcMethodExtras extras) throws Exception;
 }

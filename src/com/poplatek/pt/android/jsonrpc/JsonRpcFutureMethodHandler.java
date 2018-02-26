@@ -13,5 +13,5 @@ import java.util.concurrent.Future;
 import org.json.JSONObject;
 
 public interface JsonRpcFutureMethodHandler extends JsonRpcMethodHandler {
-    public Future<JSONObject> handle(JSONObject params, JsonRpcMethodExtras extras) throws Exception;
+    Future<JSONObject> handle(JSONObject params, JsonRpcMethodExtras extras) throws Exception;
 }

@@ -1,6 +1,8 @@
+RELEASE_VERSION:=$(shell bash get_sdk_version.sh)
+
 .PHONY: all
 all:
-	echo "Nothing yet"
+	@echo "Nothing yet (RELEASE_VERSION=$(RELEASE_VERSION))"
 
 .PHONY: clean
 clean:
@@ -28,3 +30,7 @@ uncrustify-check-legacy:
 fixme-check:
 	if grep FIXME $(shell find src/ -type f -name '*.java'); then echo Found FIXMEs; false; fi
 	if grep FIXME $(shell find apps/ -type f -name '*.java'); then echo Found FIXMEs; false; fi
+
+.PHONY: dist-archive
+dist-archive:
+	git archive --format zip -o /tmp/poplatek-pt-android-sdk-$(RELEASE_VERSION).zip --prefix poplatek-pt-android-sdk-$(RELEASE_VERSION)/ HEAD

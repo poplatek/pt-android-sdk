@@ -25,6 +25,7 @@ import com.poplatek.pt.android.util.CompletableFutureSubset;
     private static final int CONNECT_TIMEOUT = 10 * 1000;
     private static final int READ_BUFFER_SIZE = 512;
     private static final long READ_THROTTLE_SLEEP = 2 * 1000;
+    private static final long READ_THROTTLE_NONINTERACTIVE = 5 * 1000;
 
     private String host = null;
     private int port = 0;
@@ -39,6 +40,8 @@ import com.poplatek.pt.android.util.CompletableFutureSubset;
     private CompletableFutureSubset<Void> connectedFuture = new CompletableFutureSubset<Void>();
     private CompletableFutureSubset<Exception> closedFuture = new CompletableFutureSubset<Exception>();
     private ConcurrentLinkedQueue<byte []> readQueue = new ConcurrentLinkedQueue<byte []>();
+    private long lastInternetReadThrottle = -1;
+    /*package*/ long lastWriteAttention = 0;
 
     public NetworkProxyConnection(String host, int port, long id, NetworkProxy proxy, long linkSpeed) {
         this.host = host;
@@ -150,6 +153,7 @@ import com.poplatek.pt.android.util.CompletableFutureSubset;
             }
             if (throttleInternetRead()) {
                 Log.d(logTag, "too much queued read data, throttle internet reads");
+                lastInternetReadThrottle = SystemClock.uptimeMillis();
                 SystemClock.sleep(READ_THROTTLE_SLEEP);
                 continue;
             }
@@ -192,5 +196,25 @@ import com.poplatek.pt.android.util.CompletableFutureSubset;
             res += data.length;
         }
         return res;
+    }
+
+    public boolean hasPendingData() {
+        return !readQueue.isEmpty();
+    }
+
+    // Heuristic estimate whether the connection seems interactive or a
+    // background data transfer connection.  This doesn't need to be right
+    // 100% of the time, as it only affects rate limiting.
+    public boolean seemsInteractive() {
+        // Minimally functional: if read throttle limit was hit, consider
+        // connection non-interactive for a certain window of time.
+        // XXX: Could be improved by considering queued data amount also.
+        // For now checking only Internet throttling works well enough
+        // because the Internet reads are quite strictly throttled.
+        if (lastInternetReadThrottle >= 0 &&
+            SystemClock.uptimeMillis() < lastInternetReadThrottle + READ_THROTTLE_NONINTERACTIVE) {
+            return false;
+        }
+        return true;
     }
 }

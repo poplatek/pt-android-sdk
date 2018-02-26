@@ -51,6 +51,7 @@ public class NetworkProxy {
     private static final String logTag = "NetworkProxy";
     private static final long WRITE_TRIGGER_TIMEOUT = 5000;
     private static final long WRITE_THROTTLE_SLEEP = 2500;
+    private static final int PREFER_INTERACTIVE_LIMIT = 3;
 
     private HashMap<Long, NetworkProxyConnection> connections = new HashMap<Long, NetworkProxyConnection>();
     private Long connectionIds[] = null;
@@ -61,6 +62,7 @@ public class NetworkProxy {
     private boolean started = false;
     private boolean stopped = false;
     private boolean allowConnections = false;
+    private int selectPreferInteractiveCount = 0;
 
     public NetworkProxy(JsonRpcConnection conn, RateLimiter dataWriteLimiter, long linkSpeed) {
         this.conn = conn;
@@ -157,6 +159,7 @@ public class NetworkProxy {
                 Exception cause = null;
                 try {
                     runWriteLoop();
+                    Log.d(logTag, "write loop exited");
                 } catch (Exception e) {
                     Log.d(logTag, "write loop failed", e);
                     cause = e;
@@ -193,7 +196,7 @@ public class NetworkProxy {
             // the key set (which should no longer grow).
             NetworkProxyConnection conns[] = connections.values().toArray(new NetworkProxyConnection[0]);
             for (NetworkProxyConnection c : conns) {
-                Log.i(logTag, "closing proxy connection ID " + c.getConnectionId());
+                Log.i(logTag, "closing proxy connection ID " + c.getConnectionId(), cause);
                 try {
                     c.close(new RuntimeException("proxy exiting", cause));
                 } catch (Exception e) {
@@ -205,8 +208,72 @@ public class NetworkProxy {
         }
     }
 
+    // True if connection needs to write to JSONPOS, either data or a
+    // NetworkDisconnected message.
+    private boolean connectionNeedsWrite(NetworkProxyConnection c) {
+        return c.hasPendingData() || c.isClosed();
+    }
+
+    // Select a network connection next serviced for a write.  This selection
+    // must ensure rough fairness (= all connections get data transfer), and
+    // should ideally favor connections that seem interactive.  Also closed
+    // connections must be selected so that NetworkDisconnected gets sent.
+    //
+    // Current approach: on most writes prefer interactive-looking connections
+    // over non-interactive ones.  Use a 'last selected for write' timestamp
+    // to round robin over connections, i.e. we select the connection which
+    // has least recently received attention.
+    private NetworkProxyConnection selectConnectionHelper(boolean interactiveOnly) {
+        NetworkProxyConnection best = null;
+        long oldest = -1;
+        Long[] keys = connectionIds;
+
+        for (int idx = 0; idx < keys.length; idx++) {
+            long connId = keys[idx];
+            NetworkProxyConnection c = connections.get(connId);
+            if (c != null && connectionNeedsWrite(c) &&
+                (!interactiveOnly || c.seemsInteractive())) {
+                if (oldest < 0 || c.lastWriteAttention < oldest) {
+                    best = c;
+                    oldest = c.lastWriteAttention;
+                }
+            }
+        }
+
+        if (best != null) {
+            best.lastWriteAttention = SystemClock.uptimeMillis();
+        }
+        return best;
+    }
+
+    private NetworkProxyConnection selectConnectionForWrite() {
+        // To ensure rough fairness run a looping index over the connection
+        // ID set.  The set may change so we may skip or process a certain
+        // ID twice, but this happens very rarely in practice so it doesn't
+        // matter.
+        Long[] keys = connectionIds;
+        NetworkProxyConnection res = null;
+        if (selectPreferInteractiveCount < PREFER_INTERACTIVE_LIMIT) {
+            res = selectConnectionHelper(true);
+            if (res != null) {
+                Log.d(logTag, String.format("select interactive connection %d for data write", res.getConnectionId()));
+                selectPreferInteractiveCount++;
+                return res;
+            }
+        }
+        selectPreferInteractiveCount = 0;
+
+        res = selectConnectionHelper(false);
+        if (res != null) {
+            Log.d(logTag, String.format("select connection %d for data write", res.getConnectionId()));
+            return res;
+        }
+
+        Log.d(logTag, "no connection in need of writing, skip write");
+        return res;
+    }
+
     private void runWriteLoop() throws Exception {
-        int idIndex = 0;
         for (;;) {
             //Log.v(logTag, "network proxy write loop");
             if (conn.isClosed()) {
@@ -230,78 +297,61 @@ public class NetworkProxy {
                 continue;
             }
 
-            // Rough fairness; run a looping index over the connection
-            // ID set.  The set may change so we may skip or process
-            // a certain ID twice, but this happens very rarely in
-            // practice so it doesn't matter.
+            // XXX: Add integration to terminal idle state so that when a
+            // transaction is active we could reduce background transfer
+            // bandwidth and make data fragments smaller to minimize latency.
+
             boolean wrote = false;
-            Long[] keys = connectionIds;
-            if (keys.length == 0) {
-                idIndex = 0;
-            } else {
-                idIndex = (idIndex + 1) % keys.length;
-                int startIndex = idIndex;
-                int currIndex = startIndex;
-                while (true) {
-                    long id = keys[currIndex];
-                    NetworkProxyConnection c = connections.get(id);
-                    //Log.v(logTag, String.format("check index %d/%d, conn id %d for data", currIndex, keys.length, id));
-                    if (c != null) {
-                        byte[] data = c.getQueuedReadData();
-                        if (data != null) {
-                            // Queue data to be written to JSONRPC.  Here we assume the caller is
-                            // only providing us with reasonably small chunks (see read buffer size
-                            // in NetworkProxyConnection) so that they can be written out as individual
-                            // Data notifys without merging or splitting.
+            NetworkProxyConnection c = selectConnectionForWrite();
 
-                            //Log.v(logTag, String.format("connection id %d has data (chunk is %d bytes)", id, data.length));
+            if (c != null) {
+                byte[] data = c.getQueuedReadData();
+                if (data != null) {
+                    // Queue data to be written to JSONRPC.  Here we assume the caller is
+                    // only providing us with reasonably small chunks (see read buffer size
+                    // in NetworkProxyConnection) so that they can be written out as individual
+                    // Data notifys without merging or splitting.
 
-                            if (dataWriteLimiter != null) {
-                                dataWriteLimiter.consumeSync(data.length);  // unencoded size
-                            }
-                            JSONObject params = new JSONObject();
-                            params.put("id", id);  // connection id
-                            params.put("data", Base64.encodeToString(data, Base64.NO_WRAP));
-                            conn.sendNotifySync("Data", params);
+                    //Log.v(logTag, String.format("connection id %d has data (chunk is %d bytes)", id, data.length));
 
-                            wrote = true;
-                            break;
-                        } else if (c.isClosed()) {
-                            // Connection has no data and is closed, issue NetworkDisconnected
-                            // and stop tracking.
-
-                            //Log.v(logTag, String.format("connection id %d has no data and is closed -> send NetworkDisconnected", id));
-
-                            String reason = null;
-                            Future<Exception> closedFut = c.getClosedFuture();
-                            try {
-                                Exception e = closedFut.get();
-                                reason = e.toString();
-                            } catch (Exception e) {
-                                reason = "failed to get reason: " + e.toString();
-                            }
-
-                            connections.remove(id);
-                            updateConnectionKeySet();
-
-                            JSONObject params = new JSONObject();
-                            params.put("connection_id", id);
-                            if (reason != null) {
-                                params.put("reason", reason);
-                            }
-
-                            // Result is ignored for now.  We could maybe retry on error
-                            // but there's no known reason for this to fail.
-                            conn.sendRequestAsync("NetworkDisconnected", params);
-
-                            wrote = true;
-                            break;
-                        }
+                    if (dataWriteLimiter != null) {
+                        dataWriteLimiter.consumeSync(data.length);  // unencoded size
                     }
-                    currIndex = (currIndex + 1) % keys.length;
-                    if (currIndex == startIndex) {
-                        break;
+                    JSONObject params = new JSONObject();
+                    params.put("id", c.getConnectionId());
+                    params.put("data", Base64.encodeToString(data, Base64.NO_WRAP));
+                    conn.sendNotifySync("Data", params);
+
+                    wrote = true;
+                } else if (c.isClosed()) {
+                    // Connection has no data and is closed, issue NetworkDisconnected
+                    // and stop tracking.
+
+                    //Log.v(logTag, String.format("connection id %d has no data and is closed -> send NetworkDisconnected", id));
+
+                    String reason = null;
+                    Future<Exception> closedFut = c.getClosedFuture();
+                    try {
+                        Exception e = closedFut.get();
+                        reason = e.toString();
+                    } catch (Exception e) {
+                        reason = "failed to get reason: " + e.toString();
                     }
+
+                    connections.remove(c.getConnectionId());
+                    updateConnectionKeySet();
+
+                    JSONObject params = new JSONObject();
+                    params.put("connection_id", c.getConnectionId());
+                    if (reason != null) {
+                        params.put("reason", reason);
+                    }
+
+                    // Result is ignored for now.  We could maybe retry on error
+                    // but there's no known reason for this to fail.
+                    conn.sendRequestAsync("NetworkDisconnected", params);
+
+                    wrote = true;
                 }
             }
 

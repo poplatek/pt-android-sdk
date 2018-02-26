@@ -13,6 +13,8 @@ import android.util.Log;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import com.poplatek.pt.android.util.ExceptionUtil;
+
 public class JsonRpcException extends Exception {
     private static final String logTag = "JsonRpcException";
     private static final int MAX_CODE_LENGTH = 256;
@@ -66,6 +68,7 @@ public class JsonRpcException extends Exception {
     }
 
     // Get a formatted traceback with unsuppressed cause chain.
+    // Assume caller has unwrapped ExecutionExceptions.
     public static String formatJsonRpcDefaultDetailsFull(Throwable t, String code, String message) {
         try {
             StringBuilder sb = new StringBuilder();
@@ -110,7 +113,8 @@ public class JsonRpcException extends Exception {
 
     // Get a formatted traceback using .printStackTrace() on a Throwable.
     // On Android .printStackTrace() provides a reasonable (though suppressed)
-    // cause chain without the need to walk the chain manually.
+    // cause chain without the need to walk the chain manually.  Assume
+    // caller has unwrapped ExecutionExceptions.
     public static String formatJsonRpcDefaultDetailsShort(Throwable t, String code, String message) {
         try {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -218,6 +222,8 @@ public class JsonRpcException extends Exception {
         String stringCode = "UNKNOWN";
         String message = exc.getMessage();
         String details;
+
+        exc = ExceptionUtil.unwrapExecutionExceptionsToThrowable(exc);
 
         // Round trip exceptions coming from JSONRPC cleanly.  For other exceptions
         // use JsonRpcException() constructor which guarantees sanitized and clipped

@@ -84,9 +84,16 @@ import org.json.JSONException;
 import android.util.Log;
 import android.os.SystemClock;
 
+import com.poplatek.pt.android.util.StatsMap;
 import com.poplatek.pt.android.util.RateLimiter;
 import com.poplatek.pt.android.util.CompletableFutureSubset;
 import com.poplatek.pt.android.util.InternalErrorException;
+import com.poplatek.pt.android.util.ExceptionUtil;
+
+class JsonRpcTrialParseResult {
+    JSONObject msg;
+    int skip;
+}
 
 public class JsonRpcConnection {
     private static final long DEFAULT_KEEPALIVE_IDLE = 30 * 1000;
@@ -141,10 +148,10 @@ public class JsonRpcConnection {
     private long statsBoxesReceived = 0;  // _Sync included
     private long statsLastTime = 0;
     private long statsLogInterval = 300 * 1000;
-    private final HashMap<String, Long> statsOutboundRequests = new HashMap<String, Long>();
-    private final HashMap<String, Long> statsOutboundNotifys = new HashMap<String, Long>();
-    private final HashMap<String, Long> statsInboundRequests = new HashMap<String, Long>();
-    private final HashMap<String, Long> statsInboundNotifys = new HashMap<String, Long>();
+    private final StatsMap statsOutboundRequests = new StatsMap();
+    private final StatsMap statsOutboundNotifys = new StatsMap();
+    private final StatsMap statsInboundRequests = new StatsMap();
+    private final StatsMap statsInboundNotifys = new StatsMap();
 
     /*
      *  Public API
@@ -282,7 +289,7 @@ public class JsonRpcConnection {
         boolean wasEmpty = pendingOutboundRequests.isEmpty();
         pendingOutboundRequests.put(id, result);
         writeBox(msg);
-        bumpStat(statsOutboundRequests, method);
+        statsOutboundRequests.bump(method);
 
         // If pending requests goes from 0->1, trigger an immediate
         // keepalive check to trigger a new keepalive quickly.
@@ -321,7 +328,7 @@ public class JsonRpcConnection {
         msg.put("params", params != null ? params : new JSONObject());
 
         writeBox(msg);
-        bumpStat(statsOutboundNotifys, method);
+        statsOutboundNotifys.bump(method);
     }
 
     public void sendNotifySync(String method, JSONObject params) throws Exception {
@@ -352,40 +359,8 @@ public class JsonRpcConnection {
             Log.i(logTag, "wanted to set close reason, but argument was null; ignoring");
         } else {
             Log.d(logTag, "setting close reason", exc);
-            closeReason = exc;
+            closeReason = ExceptionUtil.unwrapExecutionExceptionsToException(exc);
         }
-    }
-
-    private void bumpStat(HashMap<String, Long> map, String method) {
-        if (method == null) {
-            return;
-        }
-        if (map.containsKey(method)) {
-            long prev = map.get(method);
-            map.put(method, prev + 1);
-        } else {
-            map.put(method, 1L);
-        }
-    }
-
-    private void formatStatsMap(StringBuilder sb, HashMap<String,Long> map) {
-        sb.append("{");
-        String keys[] = map.keySet().toArray(new String[0]);
-        Arrays.sort(keys);
-        boolean first = true;
-        for (String key : keys) {
-            if (first) {
-                first = false;
-                sb.append(" ");
-            } else {
-                sb.append(", ");
-            }
-            sb.append(String.format("%s:%d", key, map.get(key)));
-        }
-        if (!first) {
-            sb.append(" ");
-        }
-        sb.append("}");
     }
 
     private void logStats() {
@@ -400,13 +375,13 @@ public class JsonRpcConnection {
         }
         sb.append(String.format(", bytesOut=%d, boxesOut=%d, bytesIn=%d, boxesIn=%d", statsBytesSent, statsBoxesSent, statsBytesReceived, statsBoxesReceived));
         sb.append(", outbound requests: ");
-        formatStatsMap(sb, statsOutboundRequests);
+        statsOutboundRequests.formatTo(sb);
         sb.append(", outbound notifys: ");
-        formatStatsMap(sb, statsOutboundNotifys);
+        statsOutboundNotifys.formatTo(sb);
         sb.append(", inbound requests: ");
-        formatStatsMap(sb, statsInboundRequests);
+        statsInboundRequests.formatTo(sb);
         sb.append(", inbound notifys: ");
-        formatStatsMap(sb, statsInboundNotifys);
+        statsInboundNotifys.formatTo(sb);
 
         Log.i(logTag, sb.toString());
     }
@@ -473,7 +448,7 @@ public class JsonRpcConnection {
         msg.put("params", params != null ? params : new JSONObject());
 
         writeBox(msg);
-        bumpStat(statsOutboundRequests, method);
+        statsOutboundRequests.bump(method);
     }
 
     private void writeJsonrpcResult(String method, String id, JSONObject result) throws JSONException, IOException {
@@ -630,6 +605,25 @@ public class JsonRpcConnection {
     /*
      *  Close handling
      */
+
+    // For Suspend test use, not fully functional.
+    public void closeStreamsRaw() {
+        Log.i(logTag, "hard closing input and output streams");
+        try {
+            if (connOs != null) {
+                connOs.close();
+            }
+        } catch (Exception e) {
+            Log.i(logTag, "failed to close output stream, ignoring", e);
+        }
+        try {
+            if (connIs != null) {
+                connIs.close();
+            }
+        } catch (Exception e) {
+            Log.i(logTag, "failed to close input stream, ignoring", e);
+        }
+    }
 
     private void closeRaw(Exception reason) {
         // Internal 'closeReason' sticks to first local *or* remote close
@@ -811,6 +805,7 @@ public class JsonRpcConnection {
                 //Log.v(logTag, "read thread starting");
                 try {
                     runReadLoop();
+                    Log.v(logTag, "read thread exited with success");
                     close(new JsonRpcException("CONNECTION_CLOSED", "read loop exited cleanly", null, null));
                 } catch (Exception e) {
                     Log.i(logTag, "read thread failed", e);
@@ -849,7 +844,7 @@ public class JsonRpcConnection {
                     msg.put("params", params);
                     JSONObject error = JsonRpcException.exceptionToErrorBox(reason);
                     params.put("error", error);
-                    bumpStat(statsOutboundNotifys, "_CloseReason");
+                    statsOutboundNotifys.bump("_CloseReason");
                     writeBox(msg, false); // direct write, skip queue; allowed also when in closing state
                 } catch (Exception e) {
                     Log.i(logTag, "failed to send _CloseReason", e);
@@ -904,12 +899,6 @@ public class JsonRpcConnection {
             pendingKeepalive = (CompletableFutureSubset<JSONObject>)resFut;
             try {
                 resFut.get(KEEPALIVE_REQUEST_TIMEOUT, TimeUnit.MILLISECONDS);
-            } catch (ExecutionException e) {
-                // Minimal workaround to get the real Exception inside the
-                // ExecutionException wrapping which we need to get a good
-                // exception mapping for JSONRPC.  Better solution to be
-                // implemented later.
-                throw (Exception) e.getCause();
             } catch (TimeoutException e) {
                 throw new JsonRpcException("KEEPALIVE", "keepalive timeout", null, null);
             }
@@ -965,6 +954,73 @@ public class JsonRpcConnection {
             SystemClock.sleep(DISCARD_LOOP_DELAY);
         }
         Log.i(logTag, String.format("discarded %d initial bytes in %d ms", discardedBytes, durationMillis));
+    }
+
+    // Trial parse a length prefixed (HHHHHHHH:<...>\n) JSONRPC frame from
+    // a given buffer with 'buflen' available bytes, starting at offset 'base'.
+    // There are three possible outcomes:
+    //   1. JsonRpcTrialParseResult: valid, complete frame.
+    //   2. null: possibly valid frame, but the frame is not complete.
+    //   3. throw: invalid frame.
+    private JsonRpcTrialParseResult trialParseJsonRpcFrame(byte [] buf, int base, int buflen) throws Exception {
+        int avail = buflen - base;
+
+        if (avail < 9) {
+            return null;
+        }
+
+        int len;
+        try {
+            long lenTmp = Long.parseLong(new String(buf, base, 8, "UTF-8"), 16);
+            if (lenTmp < 0) {
+                throw new JsonRpcParseErrorException(String.format("framing error: length is negative: %d", lenTmp));
+            } else if (lenTmp > maxFrameLength) {
+                throw new JsonRpcParseErrorException(String.format("framing error: frame too long: %d", lenTmp));
+            }
+            len = (int) lenTmp;
+        } catch (NumberFormatException e) {
+            throw new JsonRpcParseErrorException("framing error: cannot parse length", e);
+        } catch (UnsupportedEncodingException e) {
+            throw new JsonRpcParseErrorException("framing error: cannot parse length", e);
+        }
+
+        if (buf[base + 8] != ':') {
+            throw new JsonRpcParseErrorException("framing error: expected colon after length");
+        }
+
+        if (avail < len + 10) {
+            // No full frame received yet, continue later.  We could have a timeout for
+            // incomplete frames, but there's no need because _Keepalive monitoring will
+            // catch a never-completing frame automatically.
+            //Log.v(logTag, "frame incomplete, continue later");
+            return null;
+        }
+
+        if (buf[base + len + 9] != '\n') {
+            throw new JsonRpcParseErrorException("framing error: expected newline at end of message");
+        }
+
+        // Full frame exists in the buffer, try to parse it.  org.json.JSONTokener()
+        // is unfortunately very loose and allows a lot of non-standard syntax, see
+        // https://developer.android.com/reference/org/json/JSONTokener.html.
+        // The JSONObject constructor just calls JSONTokener internally.
+        //Log.v(logTag, String.format("parsing complete frame of %d bytes", len));
+        JSONObject msg;
+        try {
+            String jsonStr = new String(buf, base + 9, len, "UTF-8");
+            String logStr = new String(buf, base, len + 9, "UTF-8");  // omit newline
+            Log.i(logTag, String.format("RECV: %s", logStr));
+            msg = new JSONObject(jsonStr);
+        } catch (UnsupportedEncodingException e) {
+            throw new JsonRpcParseErrorException("framing error: failed to parse UTF-8 encoded text", e);
+        } catch (JSONException e) {
+            throw new JsonRpcParseErrorException("framing error: failed to parse JSON", e);
+        }
+
+        JsonRpcTrialParseResult res = new JsonRpcTrialParseResult();
+        res.msg = msg;
+        res.skip = len + 10;
+        return res;
     }
 
     private void runReadLoop() throws Exception {
@@ -1032,10 +1088,10 @@ public class JsonRpcConnection {
             // during scan.
             if (scanningSync) {
                 int available = connIs.available();  // See comments in readAndDiscard()
-                //Log.v(logTag, String.format("reading in sync mode, off=%d, space=%d, available=%d", off, space, available));
+                Log.v(logTag, String.format("reading in sync mode, off=%d, space=%d, available=%d", off, space, available));
                 if (available > 0) {
                     int got = connIs.read(buf, off, space);
-                    //Log.v(logTag, String.format("read returned %d", got));
+                    Log.v(logTag, String.format("read returned %d", got));
                     if (got < 0) {
                         throw new JsonRpcException("SYNC_FAILED", "input stream EOF while waiting for _Sync response", null, null);
                     }
@@ -1045,7 +1101,7 @@ public class JsonRpcConnection {
                     statsBytesReceived += got;
                     off += got;
                 } else {
-                    //Log.v(logTag, "no available data, sleep and retry");
+                    Log.v(logTag, "no available data, sleep and retry");
                     SystemClock.sleep(250);
                 }
             } else {
@@ -1063,122 +1119,86 @@ public class JsonRpcConnection {
                 off += got;
             }
 
-            // If in _Sync mode, discard any data that doesn't look like a frame
-            // beginning ("HHHHHHHH:").  In principle the best approach would be
-            // to try parsing at every offset, but in practice scanning for known
-            // initial 10 byte pattern is good enough.
-            if (scanningSync && off >= 9) {
-                int firstValidIndex = -1;
-                for (int i = 0; i < off - 9; i++) {
-                    boolean prefixValid =
-                        isHexDigit(buf[i]) && isHexDigit(buf[i + 1]) &&
-                        isHexDigit(buf[i + 2]) && isHexDigit(buf[i + 3]) &&
-                        isHexDigit(buf[i + 4]) && isHexDigit(buf[i + 5]) &&
-                        isHexDigit(buf[i + 6]) && isHexDigit(buf[i + 7]) &&
-                        buf[i + 8] == ':';
-                    if (prefixValid) {
-                        firstValidIndex = i;
+            // For _Sync mode, trial parse at every offset until we find a _Sync
+            // reply.  Ignore any errors.  Note that we must scan every available
+            // position because there may be a huge pending frame before a _Sync
+            // reply (e.g. "12345678:..." which never completes) and we must not
+            // get stuck in that pending frame.
+            if (scanningSync) {
+                for (int base = 0; base < off; base++) {
+                    // Quick pre-check: skip silently unless at least length appears valid.
+                    // This is not strictly necessary except to reduce log output from
+                    // trial parse attempts.
+                    int avail = off - base;
+                    if (avail < 9) {
                         break;
                     }
-                }
+                    boolean prefixValid = isHexDigit(buf[base + 0]) && isHexDigit(buf[base + 1]) &&
+                                          isHexDigit(buf[base + 2]) && isHexDigit(buf[base + 3]) &&
+                                          isHexDigit(buf[base + 4]) && isHexDigit(buf[base + 5]) &&
+                                          isHexDigit(buf[base + 6]) && isHexDigit(buf[base + 7]) &&
+                                          buf[base + 8] == ':';
+                    if (!prefixValid) {
+                        continue;
+                    }
+                    try {
+                        Log.i(logTag, String.format("trial parsing at base offset %d/%d", base, off));
 
-                // If a valid index is found, discard any data prior to the index.
-                // If no valid index is found, we could discard some data but because
-                // our read buffer is relatively large, there's no need to do that
-                // with RFCOMM (= we'll find the valid index eventually).
-                if (firstValidIndex > 0) {
-                    Log.d(logTag, String.format("skipping %d bytes to potentially valid frame start", firstValidIndex));
-                    System.arraycopy(buf, firstValidIndex, buf, 0, off - firstValidIndex);
-                    off = off - firstValidIndex;
-                } else if (firstValidIndex == 0) {
-                    Log.d(logTag, "no need to skip bytes, valid frame seems to start at index 0");
-                } else {
-                    Log.d(logTag, "no valid frame start found, don't skip data");
-                    continue;
+                        JsonRpcTrialParseResult trialParseResult = trialParseJsonRpcFrame(buf, base, off);
+                        if (trialParseResult != null) {
+                            JSONObject msg = trialParseResult.msg;
+                            if (msg.optString("jsonrpc", "").equals("2.0") &&
+                                msg.optString("id", "").equals(syncId) &&
+                                msg.optJSONObject("result") != null) {
+                                Log.i(logTag, String.format("got _Sync response at offset %d, moving to non-sync mode", base));
+                                scanningSync = false;
+                                statsReadyTime = SystemClock.uptimeMillis();
+                                readyFuture.complete(null);
+
+                                System.arraycopy(buf, base + trialParseResult.skip,
+                                                 buf, 0, off - (base + trialParseResult.skip));
+                                off = off - (base + trialParseResult.skip);
+                                break;
+                            }
+
+                        }
+                    } catch (Exception e) {
+                        Log.i(logTag, String.format("error parsing _Sync reply at offset %d, ignoring)", base), e);
+                    }
                 }
             }
 
-            // Trial parse all completed frames.  Note that a single read()
-            // may complete more than one frame and we must handle them all
-            // before issuing another read() which may block indefinitely.
-            while (true) {
-                //Log.v(logTag, String.format("read loop, off=%d", off));
-                if (off < 9) {  // HHHHHHHH:
-                    // No length prefix yet, continue later.
-                    //Log.v(logTag, "no length prefix yet, continue later");
-                    break;
-                }
+            // For non-_Sync mode, trial parse all completed frames.  Note that a
+            // single read() may complete more than one frame and we must handle
+            // them all before issuing another read() which may block indefinitely.
+            if (!scanningSync) {
+                while (true) {
+                    //Log.v(logTag, String.format("read loop, off=%d", off));
 
-                int len;
-                try {
-                    long lenTmp = Long.parseLong(new String(buf, 0, 8, "UTF-8"), 16);
-                    if (lenTmp < 0) {
-                        throw new JsonRpcParseErrorException(String.format("framing error: length is negative: %d", lenTmp));
-                    } else if (lenTmp > maxFrameLength) {
-                        throw new JsonRpcParseErrorException(String.format("framing error: frame too long: %d", lenTmp));
+                    int base = 0;
+                    JsonRpcTrialParseResult trialParseResult = trialParseJsonRpcFrame(buf, base, off);
+                    JSONObject msg = null;
+                    if (trialParseResult == null) {
+                        // Partial frame, keep reading.
+                        break;
                     }
-                    len = (int) lenTmp;
-                } catch (NumberFormatException e) {
-                    throw new JsonRpcParseErrorException("framing error: cannot parse length", e);
-                } catch (UnsupportedEncodingException e) {
-                    throw new JsonRpcParseErrorException("framing error: cannot parse length", e);
-                }
-                if (buf[8] != ':') {
-                    throw new JsonRpcParseErrorException("framing error: expected colon after length");
-                }
-                if (off < len + 10) {
-                    // No full frame received yet, continue later.  We could have a timeout for
-                    // incomplete frames, but there's no need because _Keepalive monitoring will
-                    // catch a never-completing frame automatically.
-                    //Log.v(logTag, "frame incomplete, continue later");
-                    break;
-                }
-                if (buf[len + 9] != '\n') {
-                    throw new JsonRpcParseErrorException("framing error: expected newline at end of message");
-                }
+                    System.arraycopy(buf, base + trialParseResult.skip,
+                                     buf, 0, off - (base + trialParseResult.skip));
+                    off = off - (base + trialParseResult.skip);
+                    msg = trialParseResult.msg;
 
-                // Full frame exists in the buffer, try to parse it, then remove it from the buffer.
-                // org.json.JSONTokener() is unfortunately very loose and allows a lot of non-standard
-                // syntax, see https://developer.android.com/reference/org/json/JSONTokener.html.
-                // The JSONObject constructor just calls JSONTokener internally.
-                //Log.v(logTag, String.format("parsing complete frame of %d bytes", len));
-                JSONObject msg;
-                try {
-                    String jsonStr = new String(buf, 9, len, "UTF-8");
-                    String logStr = new String(buf, 0, len + 9, "UTF-8");  // omit newline
-                    Log.i(logTag, String.format("RECV: %s", logStr));
-                    msg = new JSONObject(jsonStr);
-                } catch (UnsupportedEncodingException e) {
-                    throw new JsonRpcParseErrorException("framing error: failed to parse utf-8 encoded text", e);
-                } catch (JSONException e) {
-                    throw new JsonRpcParseErrorException("framing error: failed to parse JSON", e);
-                }
-                System.arraycopy(buf, len + 10, buf, 0, off - (len + 10));
-                off = off - (len + 10);
-
-                // Successfully parsed a framed message, handle it.  If the handler
-                // throws, assume it's an internal error and drop the transport connection.
-                // Message processing must catch any expected errors (such as a user
-                // callback throwing).
-                //Log.v(logTag, "processing parsed message");
-                try {
-                    if (scanningSync) {
-                        Log.i(logTag,String.format("parsed frame in sync mode: %s", msg.toString()));
-                        if (msg.optString("jsonrpc", "").equals("2.0") &&
-                            msg.optString("id", "").equals(syncId) &&
-                            msg.optJSONObject("result") != null) {
-                            Log.i(logTag, "got _Sync response, moving to non-sync mode");
-                            scanningSync = false;
-                            statsReadyTime = SystemClock.uptimeMillis();
-                            readyFuture.complete(null);
-                        }
-                    } else {
+                    // Successfully parsed a framed message, handle it.  If the handler
+                    // throws, assume it's an internal error and drop the transport connection.
+                    // Message processing must catch any expected errors (such as a user
+                    // callback throwing).
+                    //Log.v(logTag, "processing parsed message");
+                    try {
                         statsBoxesReceived++;
                         processBox(msg);
+                    } catch (Exception e) {
+                        Log.d(logTag, "failed to process incoming frame", e);
+                        throw e;
                     }
-                } catch (Exception e) {
-                    Log.d(logTag, "failed to process incoming frame", e);
-                    throw e;
                 }
             }
         }
@@ -1276,7 +1296,11 @@ public class JsonRpcConnection {
                 throw new JsonRpcInvalidRequestException("inbound request 'id' matches an already running inbound request");
             }
 
-            bumpStat(id != null ? statsInboundNotifys : statsInboundRequests, method);
+            if (id != null) {
+                statsInboundRequests.bump(method);
+            } else {
+                statsInboundNotifys.bump(method);
+            }
 
             // Inbound method or notify dispatch.  Use internal dispatcher for
             // transport level methods, otherwise refer to external dispatcher.
@@ -1379,7 +1403,7 @@ public class JsonRpcConnection {
                     }
                 }
             } catch (Exception e) {
-                Log.i(logTag, String.format("inline handler for method %s failed", e));
+                Log.i(logTag, String.format("inline handler for method %s failed", method), e);
                 if (id != null) {
                     try {
                         writeJsonrpcError(method, id, e);
@@ -1406,7 +1430,7 @@ public class JsonRpcConnection {
                             }
                         }
                     } catch (Exception e) {
-                        Log.i(logTag, String.format("thread handler for method %s failed", e));
+                        Log.i(logTag, String.format("thread handler for method %s failed", method), e);
                         if (id != null) {
                             pendingInboundRequests.remove(id);
                             try {
@@ -1429,7 +1453,7 @@ public class JsonRpcConnection {
             try {
                 tmpFut = h.handle(params, extras);
             } catch (Exception e) {
-                Log.i(logTag, String.format("future handler for method %s failed", e));
+                Log.i(logTag, String.format("future handler for method %s failed", method), e);
                 if (id != null) {
                     try {
                         writeJsonrpcError(method, id, e);
@@ -1455,19 +1479,8 @@ public class JsonRpcConnection {
                         } catch (Exception e2) {
                             close(e2);
                         }
-                    } catch (ExecutionException e) {
-                        try {
-                            // Minimal approach to ExecutionException handling.
-                            // Better solution to be implemented, e.g. exception
-                            // mapper handles ExecutionException automatically.
-                            Log.i(logTag, String.format("future handler for method %s failed (ExecutionException)", e));
-                            pendingInboundRequests.remove(id);
-                            writeJsonrpcError(method, id, e.getCause());
-                        } catch (Exception e2) {
-                            close(e2);
-                        }
                     } catch (Exception e) {
-                        Log.i(logTag, String.format("future handler for method %s failed (unexpected Exception)", e));
+                        Log.i(logTag, String.format("future handler for method %s failed", method), e);
                         try {
                             pendingInboundRequests.remove(id);
                             writeJsonrpcError(method, id, e);
@@ -1522,7 +1535,7 @@ public class JsonRpcConnection {
                 for (off = 0; off < data.length;) {
                     int left = data.length - off;
                     int now = Math.min(left, writeChunkSize);
-                    //Log.v(logTag, String.format("writing %d (range [%d,%d[) of %d bytes", now, off, off + now, data.length));
+                    Log.v(logTag, String.format("writing %d (range [%d,%d[) of %d bytes", now, off, off + now, data.length));
                     if (writeRateLimiter != null) {
                         writeRateLimiter.consumeSync(now);
                     }

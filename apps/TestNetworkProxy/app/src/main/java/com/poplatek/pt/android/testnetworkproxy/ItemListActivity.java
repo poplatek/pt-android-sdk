@@ -1,5 +1,6 @@
 package com.poplatek.pt.android.testnetworkproxy;
 
+import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
@@ -13,6 +14,7 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.TextView;
+import android.widget.Toast;
 import android.util.Log;
 
 import com.poplatek.pt.android.testnetworkproxy.dummy.DummyContent;
@@ -32,21 +34,59 @@ public class ItemListActivity extends AppCompatActivity {
      * Run RFCOMM/JSONPOS network proxy test.
      */
     private static boolean runTestOnce = true;
-    private static final String RFCOMM_TARGET_MAC = "00:07:80:23:FA:C9";
-    static void checkRunNetworkProxyTest() {
+    private static final String RFCOMM_TARGET_MAC = null;  // null is autodetect; "00:07:80:23:FA:C9";
+    private static Toast previousToast = null;
+    private boolean isResumed = false;
+
+    @Override
+    public void onPause() {
+        super.onPause();
+        Log.d("TEST", "ItemListActivity paused");
+        isResumed = false;
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        Log.d("TEST", "ItemListActivity resumed");
+        isResumed = true;
+    }
+
+    void checkRunNetworkProxyTest() {
         if (!runTestOnce) {
             return;
         }
         runTestOnce = false;
 
+        final Activity activity = this;
         Thread t = new Thread(new Runnable() {
             public void run() {
                 String deviceMac = RFCOMM_TARGET_MAC;
                 Log.i("TEST", "bluetooth test");
-                Log.i("ItemListActivity", String.format("using test device mac %s", deviceMac));
-                com.poplatek.pt.android.testnetworkproxy.BluetoothNetworkProxyTest btTest =
-                    new com.poplatek.pt.android.testnetworkproxy.BluetoothNetworkProxyTest(deviceMac);
-                btTest.runTestLoop();
+                com.poplatek.pt.android.jsonpos.BluetoothNetworkProxyRunner btRunner =
+                    new com.poplatek.pt.android.jsonpos.BluetoothNetworkProxyRunner(deviceMac);
+                btRunner.setDebugStatusCallback(new com.poplatek.pt.android.jsonpos.BluetoothNetworkProxyRunner.DebugStatusCallback() {
+                    public void updateStatus(String text) throws Exception {
+                        // Toasts as a trivial example of a DebugStatusCallback integration.
+                        final String finalText = text;
+                        activity.runOnUiThread(new Runnable() {
+                            public void run() {
+                                synchronized (activity) {
+                                    if (previousToast != null) {
+                                        previousToast.cancel();
+                                        previousToast = null;
+                                    }
+                                    if (isResumed) {
+                                        Toast t = Toast.makeText(activity, finalText, Toast.LENGTH_LONG);
+                                        previousToast = t;
+                                        t.show();
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+                btRunner.runProxyLoop();
             }
         });
         t.start();
@@ -60,6 +100,9 @@ public class ItemListActivity extends AppCompatActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // Minimal hack to run test once in the background.
+        checkRunNetworkProxyTest();
+
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_item_list);
 
@@ -133,9 +176,6 @@ public class ItemListActivity extends AppCompatActivity {
         public ViewHolder onCreateViewHolder(ViewGroup parent, int viewType) {
             View view = LayoutInflater.from(parent.getContext())
                         .inflate(R.layout.item_list_content, parent, false);
-
-            // Minimal hack to run test once in the background.
-            ItemListActivity.checkRunNetworkProxyTest();
 
             return new ViewHolder(view);
         }

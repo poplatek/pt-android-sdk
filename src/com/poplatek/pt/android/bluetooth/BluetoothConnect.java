@@ -13,6 +13,10 @@ import java.util.concurrent.Future;
 //import java.util.concurrent.CompletableFuture;  // API level 24 (Nougat)
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.Callable;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Set;
+import java.util.ArrayList;
 
 import android.util.Log;
 import android.os.ParcelUuid;
@@ -37,6 +41,51 @@ public class BluetoothConnect {
             throw new RuntimeException("failed to BluetoothAdapter.getDefaultAdapter(), device doesn't support Bluetooth");
         }
         btAdapter = adapter;
+    }
+
+    // Format a BluetoothDevice into a useful log string.
+    private static String formatDevice(BluetoothDevice btDevice) {
+        String devAddress = btDevice.getAddress();
+        BluetoothClass devClass = btDevice.getBluetoothClass();
+        int devBondState = btDevice.getBondState();
+        String devName = btDevice.getName();
+        //int devType = btDevice.getType();  // Avoid, requires API level 18.
+
+        return String.format("%s (MAC %s); class=%d, bondState=%d",
+                             devName, devAddress, devClass.getDeviceClass(), devBondState);
+    }
+
+    // Get a list of available Bluetooth devices.  A device is considered
+    // available if it is paired and likely to be a Poplatek device (such as
+    // Spire SPm20).  Device list is sorted by ascending Bluetooth name so that
+    // the result is deterministic when multiple potential devices are found.
+    // The device does not need to be connected to be considered available.
+    public BluetoothDevice[] getAvailableDevices() throws Exception {
+        ArrayList<BluetoothDevice> res = new ArrayList<BluetoothDevice>();
+        Set<BluetoothDevice> pairedDevices = btAdapter.getBondedDevices();
+
+        Log.i(logTag, "looking for available devices");
+        for (BluetoothDevice dev : pairedDevices) {
+            if (dev.getName().startsWith("SP:")) {
+                Log.i(logTag, "potential device: " + formatDevice(dev));
+                res.add(dev);
+            } else {
+                Log.i(logTag, "skipped device: " + formatDevice(dev));
+            }
+        }
+
+        Collections.sort(res, new Comparator<BluetoothDevice>() {
+            public int compare(BluetoothDevice dev1, BluetoothDevice dev2){
+                return dev1.getName().compareTo(dev2.getName());
+            }
+        });
+        /*
+           for (BluetoothDevice dev : res) {
+            Log.i(logTag, "sorted: " + dev.getName());
+           }
+         */
+
+        return res.toArray(new BluetoothDevice[0]);
     }
 
     public Future<BluetoothSocket> connect(String bluetoothMac) {
@@ -76,12 +125,7 @@ public class BluetoothConnect {
                 // I/BluetoothConnect: UUID 3: ffcacade-afde-cade-defa-cade00000000
 
                 String devAddress = btDevice.getAddress();
-                BluetoothClass devClass = btDevice.getBluetoothClass();
-                int devBondState = btDevice.getBondState();
-                String devName = btDevice.getName();
-                //int devType = btDevice.getType();  // Avoid, requires API level 18.
-                Log.i(logTag, String.format("got device: address=%s class=%d bondState=%d name=%s",
-                                            devAddress, devClass.getDeviceClass(), devBondState, devName));
+                Log.i(logTag, "got device: " + formatDevice(btDevice));
 
                 ParcelUuid uuids[] = btDevice.getUuids();
                 if (uuids == null) {
