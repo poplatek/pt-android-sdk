@@ -207,14 +207,20 @@ import com.poplatek.pt.android.util.CompletableFutureSubset;
     // 100% of the time, as it only affects rate limiting.
     public boolean seemsInteractive() {
         // Minimally functional: if read throttle limit was hit, consider
-        // connection non-interactive for a certain window of time.
+        // connection non-interactive for a certain window of time.  Also
+        // consider interactive if connection is pending a close and no
+        // data is queued so that NetworkDisconnected is sent quickly.
+        //
         // XXX: Could be improved by considering queued data amount also.
         // For now checking only Internet throttling works well enough
         // because the Internet reads are quite strictly throttled.
-        if (lastInternetReadThrottle >= 0 &&
-            SystemClock.uptimeMillis() < lastInternetReadThrottle + READ_THROTTLE_NONINTERACTIVE) {
+        if (isClosed() && !hasPendingData()) {
+            return true;
+        } else if (lastInternetReadThrottle >= 0 &&
+                   SystemClock.uptimeMillis() < lastInternetReadThrottle + READ_THROTTLE_NONINTERACTIVE) {
             return false;
+        } else {
+            return true;
         }
-        return true;
     }
 }

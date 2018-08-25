@@ -23,6 +23,12 @@
  *     is too long (several seconds), the proxy stops writing Data notifys.
  *     This may happen if the link is slower than anticipated, and backing
  *     off allows keepalives and other methods to work reasonably.
+ *
+ *  Data rate limiting tracks the background vs. interactive status of each
+ *  connection using a simple heuristic, and prefers interactive connections
+ *  when deciding which connections get write attention.  When the terminal
+ *  is in non-idle state (processing a transaction) background data is further
+ *  reduced to minimize latency for interactive use cases.
  */
 
 package com.poplatek.pt.android.jsonpos;
@@ -46,12 +52,15 @@ import com.poplatek.pt.android.jsonrpc.JsonRpcInlineMethodHandler;
 import com.poplatek.pt.android.jsonrpc.JsonRpcMethodExtras;
 import com.poplatek.pt.android.util.CompletableFutureSubset;
 import com.poplatek.pt.android.util.RateLimiter;
+import com.poplatek.pt.android.util.TokenBucketRateLimiter;
 
 public class NetworkProxy {
     private static final String logTag = "NetworkProxy";
-    private static final long WRITE_TRIGGER_TIMEOUT = 5000;
+    private static final long WRITE_TRIGGER_TIMEOUT_IDLE = 5000;
+    private static final long WRITE_TRIGGER_TIMEOUT_NONIDLE = 500;
     private static final long WRITE_THROTTLE_SLEEP = 2500;
     private static final int PREFER_INTERACTIVE_LIMIT = 3;
+    private static final long BACKGROUND_WRITE_INTERVAL = 500;
 
     private HashMap<Long, NetworkProxyConnection> connections = new HashMap<Long, NetworkProxyConnection>();
     private Long connectionIds[] = null;
@@ -63,6 +72,8 @@ public class NetworkProxy {
     private boolean stopped = false;
     private boolean allowConnections = false;
     private int selectPreferInteractiveCount = 0;
+    private boolean terminalIsIdle = true;
+    private long lastNonIdleBgWriteTime = 0;
 
     public NetworkProxy(JsonRpcConnection conn, RateLimiter dataWriteLimiter, long linkSpeed) {
         this.conn = conn;
@@ -143,6 +154,14 @@ public class NetworkProxy {
                 return null;
             }
         });
+    }
+
+    public void setTerminalIdleState(boolean isIdle) {
+        boolean trigger = (isIdle != terminalIsIdle);
+        terminalIsIdle = isIdle;
+        if (trigger) {
+            writeTriggerFuture.complete(null);
+        }
     }
 
     public void startNetworkProxySync() throws Exception {
@@ -263,14 +282,26 @@ public class NetworkProxy {
         }
         selectPreferInteractiveCount = 0;
 
+        // When terminal is not idle, send data more slowly but still keep
+        // sending it e.g. once or twice second to avoid HTTP activity
+        // timeouts.
+        if (!terminalIsIdle) {
+            long now = SystemClock.uptimeMillis();
+            if (now - lastNonIdleBgWriteTime < BACKGROUND_WRITE_INTERVAL) {
+                Log.d(logTag, "terminal is not idle, don't send background data too often");
+                return null;
+            }
+            lastNonIdleBgWriteTime = now;
+        }
+
         res = selectConnectionHelper(false);
         if (res != null) {
             Log.d(logTag, String.format("select connection %d for data write", res.getConnectionId()));
             return res;
         }
 
-        Log.d(logTag, "no connection in need of writing, skip write");
-        return res;
+        //Log.v(logTag, "no connection in need of writing, skip write");
+        return null;
     }
 
     private void runWriteLoop() throws Exception {
@@ -297,10 +328,6 @@ public class NetworkProxy {
                 continue;
             }
 
-            // XXX: Add integration to terminal idle state so that when a
-            // transaction is active we could reduce background transfer
-            // bandwidth and make data fragments smaller to minimize latency.
-
             boolean wrote = false;
             NetworkProxyConnection c = selectConnectionForWrite();
 
@@ -310,17 +337,19 @@ public class NetworkProxy {
                     // Queue data to be written to JSONRPC.  Here we assume the caller is
                     // only providing us with reasonably small chunks (see read buffer size
                     // in NetworkProxyConnection) so that they can be written out as individual
-                    // Data notifys without merging or splitting.
+                    // Data notifys without merging or splitting.  Consume rate limit after
+                    // sending the notify to minimize latency.
 
                     //Log.v(logTag, String.format("connection id %d has data (chunk is %d bytes)", id, data.length));
 
-                    if (dataWriteLimiter != null) {
-                        dataWriteLimiter.consumeSync(data.length);  // unencoded size
-                    }
                     JSONObject params = new JSONObject();
                     params.put("id", c.getConnectionId());
                     params.put("data", Base64.encodeToString(data, Base64.NO_WRAP));
                     conn.sendNotifySync("Data", params);
+
+                    if (dataWriteLimiter != null) {
+                        dataWriteLimiter.consumeSync(data.length);  // unencoded size
+                    }
 
                     wrote = true;
                 } else if (c.isClosed()) {
@@ -355,6 +384,11 @@ public class NetworkProxy {
                 }
             }
 
+            // XXX: Support for non-idle mode should be improved using a proper
+            // blocking rate limiter.  For now, when terminal is non-idle, sleep
+            // only a short interval and recheck background data writing between
+            // sleeps.
+
             // If we didn't write data, wait for a trigger future or
             // sanity timeout.
             if (!wrote) {
@@ -364,7 +398,8 @@ public class NetworkProxy {
                 }
                 //Log.v(logTag, "proxy did not write data, wait for trigger");
                 try {
-                    writeTriggerFuture.get(WRITE_TRIGGER_TIMEOUT, TimeUnit.MILLISECONDS);
+                    long timeout = terminalIsIdle ? WRITE_TRIGGER_TIMEOUT_IDLE : WRITE_TRIGGER_TIMEOUT_NONIDLE;
+                    writeTriggerFuture.get(timeout, TimeUnit.MILLISECONDS);
                 } catch (TimeoutException e) {
                     /* No trigger, sanity poll. */
                 }

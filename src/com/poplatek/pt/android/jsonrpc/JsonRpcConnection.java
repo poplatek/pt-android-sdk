@@ -117,7 +117,7 @@ public class JsonRpcConnection {
     private Thread keepaliveThread = null;
     private InputStream connIs = null;
     private OutputStream connOs = null;
-    private final ConcurrentLinkedQueue<String> writeQueue = new ConcurrentLinkedQueue<String>();
+    private final ConcurrentLinkedQueue<byte[]> writeQueue = new ConcurrentLinkedQueue<byte[]>();
     private boolean keepaliveEnabled = false;
     private long keepaliveIdleInterval = 0;
     private long keepaliveBusyInterval = 0;
@@ -341,8 +341,8 @@ public class JsonRpcConnection {
     public long getWriteQueueBytes() {
         synchronized (this) {
             long result = 0;
-            for (String s : writeQueue) {
-                result += s.length();
+            for (byte[] s : writeQueue) {
+                result += s.length;
             }
             return result;
         }
@@ -440,6 +440,17 @@ public class JsonRpcConnection {
         return sb.toString();
     }
 
+    // Android JSON binding escapes '/' as '\/' in string data.
+    // which is unnecessary because '/' is unambiguous.  Un-escape
+    // forward escapes; this replacement should be safe because
+    // escapes may only appear in JSON strings and the unescaped
+    // version is unambiguous.  It's important to ensure that the
+    // backslash itself is not escaped, i.e. '\\/' must not be
+    // un-escaped to '\/'.
+    private String unescapeJsonForwardSlash(String x) {
+        return x.replaceAll("(?<!\\)\\/", "/");
+    }
+
     private void writeJsonrpcRequest(String method, String id, JSONObject params) throws JSONException, IOException {
         JSONObject msg = new JSONObject();
         msg.put("jsonrpc", "2.0");
@@ -474,18 +485,14 @@ public class JsonRpcConnection {
         writeBox(msg);
     }
 
-    private void writeBox(JSONObject msg, boolean queued) throws IOException {
-        String msgString = ensureJsonAscii(msg.toString());
-        int msgLength = msgString.length();
-        String framed = String.format("%08x:%s\n", msgLength, msgString);
-
+    private void writeRaw(byte[] data, boolean queued) throws IOException {
         if (queued) {
             if (closingFuture.isDone() || closedFuture.isDone()) {
                 Log.i(logTag, "tried to writeBox() when connection closing/closed, dropping");
                 return;
             }
             synchronized (this) {
-                writeQueue.add(framed);
+                writeQueue.add(data);
                 writeTriggerFuture.complete(null);
             }
         } else {
@@ -494,14 +501,21 @@ public class JsonRpcConnection {
                 Log.i(logTag, "tried to writeBox() when connection closed, dropping");
                 return;
             }
-            byte data[] = framed.getBytes("UTF-8");
             statsBytesSent += data.length;
             statsBoxesSent++;
-            Log.i(logTag, String.format("SEND (non-queued): %s", framed));
+            Log.i(logTag, String.format("SEND (non-queued): %s", new String(data)));
 
             connOs.write(data);
             connOs.flush();
         }
+    }
+
+    private void writeBox(JSONObject msg, boolean queued) throws IOException {
+        String msgString = ensureJsonAscii(msg.toString());
+        int msgLength = msgString.length();
+        String framed = String.format("%08x:%s\n", msgLength, msgString);
+        byte data[] = framed.getBytes("UTF-8");
+        writeRaw(data, queued);
     }
 
     private void writeBox(JSONObject msg) throws IOException {
@@ -1038,11 +1052,16 @@ public class JsonRpcConnection {
             readAndDiscard(discardTime);
         }
 
-        // For Bluetooth RFCOMM, send a unique _Sync and hunt for a response for a
-        // limited amount of time.
+        // For Bluetooth RFCOMM, send a unique _Sync and hunt for a response
+        // for a limited amount of time.  _Sync filler is for improving SPm20
+        // RFCOMM resume behavior; SPm20 hardware loses a few bytes and may
+        // corrupt a few more after a resume.
         String syncId = null;
         if (syncEnabled) {
             Log.i(logTag, String.format("send _Sync, hunt for response within %d ms", syncTimeout));
+            String syncFiller = "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n";
+            writeRaw(syncFiller.getBytes("UTF-8"), true);
+            SystemClock.sleep(100);
             syncId = getJsonrpcId();
             writeJsonrpcRequest("_Sync", syncId, new JSONObject());
             scanningSync = true;
@@ -1115,6 +1134,7 @@ public class JsonRpcConnection {
                 if (got > space) {
                     throw new JsonRpcInternalErrorException("internal error, read() return value invalid");
                 }
+                //Log.i(logTag, "RECVHEX: " + com.poplatek.pt.android.util.Hex.encode(buf, off, got));
                 statsBytesReceived += got;
                 off += got;
             }
@@ -1505,7 +1525,7 @@ public class JsonRpcConnection {
         startedFuture.get();
 
         while (true) {
-            String framed = null;
+            byte[] data = null;
 
             checkLogStats();
 
@@ -1515,22 +1535,21 @@ public class JsonRpcConnection {
                     return;
                 }
 
-                framed = writeQueue.poll();
+                data = writeQueue.poll();
                 if (writeTriggerFuture.isDone()) {
                     //Log.v(logTag, "refresh write trigger future");
                     writeTriggerFuture = new CompletableFutureSubset<Void>();
                 }
             }
 
-            if (framed == null) {
+            if (data == null) {
                 // No frame in queue, wait until trigger or sanity poll.
                 waitFutureWithTimeout(writeTriggerFuture, WRITE_LOOP_SANITY_TIMEOUT);
             } else {
                 // When rate limiting enabled, write and consume in small
                 // pieces to handle large messages reasonably for RFCOMM.
-                Log.i(logTag, String.format("SEND: %s", framed));
+                Log.i(logTag, String.format("SEND: %s", new String(data, "UTF-8")));
                 int writeChunkSize = writeRateLimiter != null ? WRITE_CHUNK_SIZE_LIMIT : WRITE_CHUNK_SIZE_NOLIMIT;
-                byte data[] = framed.getBytes();
                 int off;
                 for (off = 0; off < data.length;) {
                     int left = data.length - off;

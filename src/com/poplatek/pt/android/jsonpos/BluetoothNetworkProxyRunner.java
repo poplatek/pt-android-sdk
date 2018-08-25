@@ -27,12 +27,34 @@ import com.poplatek.pt.android.util.ExceptionUtil;
 import com.poplatek.pt.android.util.TerminalVersion;
 
 public class BluetoothNetworkProxyRunner {
+    public enum ConnectionState {
+        DISCONNECTED, CONNECTING, CONNECTED
+    }
+
     public interface DebugStatusCallback {
         void updateStatus(String text) throws Exception;
     }
 
+    public interface TerminalInfoCallback {
+        void terminalInfo(JsonRpcConnection conn, JSONObject terminalInfo) throws Exception;
+    }
+
+    public interface StatusCallback {
+        void status(JsonRpcConnection conn, JSONObject status) throws Exception;
+    }
+
+    public interface ConnectionStateCallback {
+        void connectionState(JsonRpcConnection conn, ConnectionState state) throws Exception;
+    }
+
     private static final String logTag = "BluetoothProxy";
-    private static final long RETRY_SLEEP_MILLIS = 1000;
+    // Connection retry schedule is important for reliability.  For small
+    // connection drops the retry can be quick, but there must be a backoff
+    // to at least 10 seconds to allow SPm20 Bluetooth init to succeed when
+    // the terminal restarts.
+    private static final long RETRY_SLEEP_MILLIS_MIN = 1000;
+    private static final long RETRY_SLEEP_MILLIS_MAX = 10000;
+    private static final long RETRY_SLEEP_MILLIS_STEP = 2000;
     private static final long RFCOMM_DISCARD_TIME = 2000;
     private static final long SYNC_TIMEOUT = 5000;
     private static final long SPM20_LINK_SPEED = 10 * 1024;  // Default without .link_speed
@@ -40,7 +62,19 @@ public class BluetoothNetworkProxyRunner {
 
     BluetoothConnect connecter = null;
     String bluetoothMac = null;
-    DebugStatusCallback statusCb = null;
+    DebugStatusCallback debugStatusCb = null;
+    TerminalInfoCallback terminalInfoCb = null;
+    StatusCallback statusCb = null;
+    ConnectionStateCallback connectionStateCb = null;
+
+    boolean currentTerminalIdle = true;
+    BluetoothSocket currentBtSocket = null;
+    JsonRpcConnection currentConnection = null;
+    NetworkProxy currentProxy = null;
+
+    Exception stopReason = null;
+
+    private int failCount = 0;
 
     public BluetoothNetworkProxyRunner(String bluetoothMac) {
         this.bluetoothMac = bluetoothMac;  // null = autodetect
@@ -48,34 +82,135 @@ public class BluetoothNetworkProxyRunner {
     }
 
     public void setDebugStatusCallback(DebugStatusCallback cb) {
+        debugStatusCb = cb;
+    }
+
+    public void setTerminalInfoCallback(TerminalInfoCallback cb) {
+        terminalInfoCb = cb;
+    }
+
+    public void setStatusCallback(StatusCallback cb) {
         statusCb = cb;
     }
 
-    public void updateDebugStatus(String text) {
+    public void setConnectionStateCallback(ConnectionStateCallback cb) {
+        connectionStateCb = cb;
+    }
+
+    private void updateDebugStatus(String text) {
         try {
-            if (statusCb != null) {
-                statusCb.updateStatus(text);
+            if (debugStatusCb != null) {
+                debugStatusCb.updateStatus(text);
             }
         } catch (Exception e) {
             Log.d(logTag, "failed to update debug status, ignoring", e);
         }
     }
 
+    private void updateTerminalInfo(JsonRpcConnection conn, JSONObject terminalInfo) {
+        try {
+            if (terminalInfoCb != null) {
+                terminalInfoCb.terminalInfo(conn, terminalInfo);
+            }
+        } catch (Exception e) {
+            Log.d(logTag, "failed to update terminal info, ignoring", e);
+        }
+    }
+
+    private void updateStatus(JsonRpcConnection conn, JSONObject status) {
+        try {
+            if (statusCb != null) {
+                statusCb.status(conn, status);
+            }
+        } catch (Exception e) {
+            Log.d(logTag, "failed to update status, ignoring", e);
+        }
+    }
+
+    private void updateConnectionState(JsonRpcConnection conn, ConnectionState state) {
+        try {
+            if (connectionStateCb != null) {
+                connectionStateCb.connectionState(conn, state);
+            }
+        } catch (Exception e) {
+            Log.d(logTag, "failed to update connection state, ignoring", e);
+        }
+    }
+
+    private void closeCurrentBtSocket() {
+        if (currentBtSocket != null) {
+            try {
+                Log.i(logTag, "closing current bluetooth socket");
+                currentBtSocket.close();
+            } catch (Exception e) {
+                Log.i(logTag, "failed to close current bt socket, ignoring", e);
+            }
+        }
+    }
+
+    private void closeCurrentJsonRpcConnection(Exception reason) {
+        if(currentConnection != null) {
+            try {
+                currentConnection.close(reason);
+            } catch (Exception e) {
+                Log.i(logTag, "failed to close jsonrpc connection:", e);
+            }
+        }
+
+    }
+
     public void runProxyLoop() {
         for (;;) {
+            closeCurrentJsonRpcConnection(new RuntimeException ("closing just in case"));
+            closeCurrentBtSocket();
+
+            if (stopReason != null) {
+                break;
+            }
+
+            currentTerminalIdle = true;
+            currentBtSocket = null;
+            currentConnection = null;
+            currentProxy = null;
+
+            updateConnectionState(null, ConnectionState.DISCONNECTED);
+
             try {
+                updateConnectionState(null, ConnectionState.CONNECTING);
                 String mac = bluetoothMac != null ? bluetoothMac : autodetectTargetMac();
                 updateDebugStatus("Connecting RFCOMM to " + mac);
                 Future<BluetoothSocket> fut = connecter.connect(mac);
-                BluetoothSocket btSocket = fut.get();
+                currentBtSocket = fut.get();
                 updateDebugStatus("Success, start network proxy to " + mac);
-                runProxy(btSocket);
+                runProxy(currentBtSocket);
             } catch (Exception e) {
                 updateDebugStatus("FAILED: " + ExceptionUtil.unwrapExecutionExceptionsToThrowable(e).toString());
                 Log.i(logTag, "bluetooth connect failed, sleep and retry", e);
-                SystemClock.sleep(RETRY_SLEEP_MILLIS);
+                failCount++;
             }
+            long retrySleep = Math.min(RETRY_SLEEP_MILLIS_MIN + RETRY_SLEEP_MILLIS_STEP * failCount, RETRY_SLEEP_MILLIS_MAX);
+            Log.i(logTag, String.format("sleep %d ms", retrySleep));
+            SystemClock.sleep(retrySleep);
         }
+
+        closeCurrentJsonRpcConnection(stopReason);
+        closeCurrentBtSocket();
+
+        Log.i(logTag, "proxy loop stop reason set, stopping:", stopReason);
+    }
+
+    // Request proxy loop to stop.  Returns without waiting for the stop
+    // to complete at present.
+    public void stopProxyLoop(Exception reason) {
+        if (stopReason != null) {
+            return;
+        }
+        if (reason == null) {
+            reason = new RuntimeException("proxy stop requested by caller");
+        }
+        Log.i(logTag, "setting proxy stop reason:", reason);
+        stopReason = reason;
+        closeCurrentJsonRpcConnection(reason);
     }
 
     // Automatic target detection based on sorted device list and filtering
@@ -93,9 +228,46 @@ public class BluetoothNetworkProxyRunner {
         return devs[0].getAddress();
     }
 
+    // A simple, soft idle vs. non-idle heuristic based on the
+    // .transaction_status field of Status.  This allows data rate
+    // limiting to reduce background traffic during Purchase
+    // processing.
+    //
+    // This is not ideal as only operations involving .transaction_status
+    // are considered non-idle.  For example, DisplayScreen does not cause
+    // a non-idle status to be detected.  Future terminal versions are
+    // likely to indicate idle vs. non-idle state as an explicit field so
+    // that this can be made more accurate.
+    private void checkIdleStateChange(JSONObject status) {
+        boolean isIdle = (status.optString("transaction_status", null) == null);
+        if (currentTerminalIdle) {
+            if (!isIdle) {
+                Log.i(logTag, "terminal went from idle to non-idle");
+                if (currentProxy != null) {
+                    currentProxy.setTerminalIdleState(isIdle);
+                }
+            }
+        } else {
+            if (isIdle) {
+                Log.i(logTag, "terminal went from non-idle to idle");
+                if (currentProxy != null) {
+                    currentProxy.setTerminalIdleState(isIdle);
+                }
+            }
+        }
+        currentTerminalIdle = isIdle;
+    }
+
     private void handleJsonposStatusUpdate(JSONObject status) {
         Log.i(logTag, "STATUS: " + status.toString());
         updateDebugStatus("Status: " + status.toString());
+        checkIdleStateChange(status);
+    }
+
+    private void handleJsonposStatusUpdate(JsonRpcConnection conn, JSONObject status) {
+        Log.i(logTag, "STATUS: " + status.toString());
+        updateDebugStatus("Status: " + status.toString());
+        updateStatus(conn, status);
     }
 
     // Status poller for older terminals with no StatusEvent support.
@@ -110,7 +282,7 @@ public class BluetoothNetworkProxyRunner {
                         try {
                             JSONObject params = new JSONObject();
                             JSONObject status = conn.sendRequestSync("Status", params);
-                            handleJsonposStatusUpdate(status);
+                            handleJsonposStatusUpdate(conn, status);
                         } catch (Exception e) {
                             Log.i(logTag, "Status failed, ignoring", e);
                         }
@@ -134,7 +306,7 @@ public class BluetoothNetworkProxyRunner {
         JsonRpcDispatcher disp = new JsonRpcDispatcher();
         disp.registerMethod("StatusEvent", new JsonRpcInlineMethodHandler() {
             public JSONObject handle(JSONObject params, JsonRpcMethodExtras extras) throws Exception {
-                handleJsonposStatusUpdate(params);
+                handleJsonposStatusUpdate(extras.getConnection(), params);
                 return new JSONObject();
             }
         });
@@ -142,6 +314,7 @@ public class BluetoothNetworkProxyRunner {
         // Create a JSONRPC connection for the input/output stream, configure
         // it, and start read/write loops.
         final JsonRpcConnection conn = new JsonRpcConnection(btIs, btOs);
+        currentConnection = conn;
         conn.setKeepalive();
         //conn.setDiscard(RFCOMM_DISCARD_TIME);  // unnecessary if _Sync reply scanning is reliable
         conn.setSync(SYNC_TIMEOUT);
@@ -153,6 +326,11 @@ public class BluetoothNetworkProxyRunner {
         // Wait for _Sync to complete before sending anything.
         Log.i(logTag, "wait for connection to become ready");
         readyFut.get();
+
+        // Reset backoff.
+        failCount = 0;
+
+        updateConnectionState(conn, ConnectionState.CONNECTING);
 
         // Check TerminalInfo before enabling network proxy.  TerminalInfo
         // can provide useful information for choosing rate limits. Fall back
@@ -176,6 +354,7 @@ public class BluetoothNetworkProxyRunner {
             Log.w(logTag, "failed to get TerminalInfo");
             terminalInfo = new JSONObject();
         }
+        updateTerminalInfo(conn, terminalInfo);
 
         // Feature detection based on version comparison.  Terminal versions
         // numbers have the format MAJOR.MINOR.PATCH where each component is
@@ -226,12 +405,21 @@ public class BluetoothNetworkProxyRunner {
         // the rate limits once we have a TerminalInfo response.
         Log.i(logTag, "starting network proxy");
         NetworkProxy proxy = new NetworkProxy(conn, dataLimiter, jsonrpcWriteTokenRate /*linkSpeed*/);
+        currentProxy = proxy;
         proxy.registerNetworkMethods(disp);
         proxy.startNetworkProxySync();
+        proxy.setTerminalIdleState(currentTerminalIdle);
+
+        updateConnectionState(conn, ConnectionState.CONNECTED);
 
         //com.poplatek.pt.android.tests.JsonposTests.testFileDownloads(conn);
         //com.poplatek.pt.android.tests.JsonposTests.testSuspend(conn);
         //com.poplatek.pt.android.tests.JsonposTests.testTerminalVersionCompare();
+
+        // Check for proxy stop.
+        if (stopReason != null) {
+            throw new RuntimeException("closing because proxy stop requested");
+        }
 
         // Wait for JSONPOS connection to finish, due to any cause.
         Log.i(logTag, "wait for jsonrpc connection to finish");

@@ -16,10 +16,17 @@ import android.view.ViewGroup;
 import android.widget.TextView;
 import android.widget.Toast;
 import android.util.Log;
+import android.os.SystemClock;
+
+import java.util.List;
+
+import org.json.JSONObject;
+import org.json.JSONException;
 
 import com.poplatek.pt.android.testnetworkproxy.dummy.DummyContent;
 
-import java.util.List;
+import com.poplatek.pt.android.jsonrpc.JsonRpcConnection;
+import com.poplatek.pt.android.jsonpos.BluetoothNetworkProxyRunner;
 
 /**
  * An activity representing a list of Items. This activity
@@ -63,9 +70,8 @@ public class ItemListActivity extends AppCompatActivity {
             public void run() {
                 String deviceMac = RFCOMM_TARGET_MAC;
                 Log.i("TEST", "bluetooth test");
-                com.poplatek.pt.android.jsonpos.BluetoothNetworkProxyRunner btRunner =
-                    new com.poplatek.pt.android.jsonpos.BluetoothNetworkProxyRunner(deviceMac);
-                btRunner.setDebugStatusCallback(new com.poplatek.pt.android.jsonpos.BluetoothNetworkProxyRunner.DebugStatusCallback() {
+                BluetoothNetworkProxyRunner btRunner = new BluetoothNetworkProxyRunner(deviceMac);
+                btRunner.setDebugStatusCallback(new BluetoothNetworkProxyRunner.DebugStatusCallback() {
                     public void updateStatus(String text) throws Exception {
                         // Toasts as a trivial example of a DebugStatusCallback integration.
                         final String finalText = text;
@@ -86,6 +92,37 @@ public class ItemListActivity extends AppCompatActivity {
                         });
                     }
                 });
+                btRunner.setTerminalInfoCallback(new BluetoothNetworkProxyRunner.TerminalInfoCallback() {
+                    public void terminalInfo(JsonRpcConnection conn, JSONObject terminalInfo) {
+                        Log.i("TEST", "Got terminalInfo() callback: " + terminalInfo.toString() + ", conn: " + (conn != null ? conn.toString() : "null"));
+                    }
+                });
+                btRunner.setStatusCallback(new BluetoothNetworkProxyRunner.StatusCallback() {
+                    public void status(JsonRpcConnection conn, JSONObject status) {
+                        Log.i("TEST", "Got status() callback: " + status.toString() + ", conn: " + (conn != null ? conn.toString() : "null"));
+                    }
+                });
+                btRunner.setConnectionStateCallback(new BluetoothNetworkProxyRunner.ConnectionStateCallback() {
+                    public void connectionState(JsonRpcConnection conn, BluetoothNetworkProxyRunner.ConnectionState state) {
+                        Log.i("TEST", "Got connectionState() callback: " + state.toString() + ", conn: " + (conn != null ? conn.toString() : "null"));
+                    }
+                });
+
+                // Example of how proxy runner can be stopped.  Once stopped, it
+                // cannot be restarted, so a new instance must be created to start
+                // again.
+                final BluetoothNetworkProxyRunner btRunner_final = btRunner;
+                new Thread(new Runnable() {
+                    public void run() {
+                        /*
+                           Log.i("TEST", "sleep before stopping proxy runner");
+                           SystemClock.sleep(30000);
+                           Log.i("TEST", "requesting proxy runner to stop");
+                           btRunner_final.stopProxyLoop(new Exception("test timer stop"));
+                         */
+                    }
+                }).start();
+
                 btRunner.runProxyLoop();
             }
         });
